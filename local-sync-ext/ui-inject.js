@@ -673,16 +673,19 @@
     try {
       const ids = await invoke('vb-local-sync:running-workers')
       window.__vbOsRunningIds = new Set((ids || []).map(String))
-    } catch (e) {
-      try { await invoke('vb-local-sync:ui-log', { act: 'os-running-fail', error: String(e && e.message || e) }) } catch {}
+    } catch (e) {}
+  }
+  try {
+    const r = ipc()
+    if (r && r.on) {
+      r.on('vb-local-sync:running', (_e, ids) => {
+        window.__vbOsRunningIds = new Set((ids || []).map(String))
+        enhanceBrowserTable()
+      })
     }
-  }
-  async function pollAll() {
-    await Promise.all([pollOsRunning(), pollChromeRunning()])
-    enhanceBrowserTable()
-  }
-  pollAll()
-  setInterval(pollAll, 4000)
+  } catch {}
+  pollOsRunning().then(() => enhanceBrowserTable())
+  setInterval(() => { pollOsRunning().then(() => enhanceBrowserTable()) }, 1000)
 
   mo.observe(document.body || document.documentElement, { childList: true, subtree: true })
   window.vbLocalSyncEnhanceTable = enhanceBrowserTable

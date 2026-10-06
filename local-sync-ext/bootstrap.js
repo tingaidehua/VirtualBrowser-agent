@@ -158,26 +158,26 @@ function install() {
 
   ipcMain.handle('vb-local-sync:running-workers', wrap(async () => workerCtl.listIds()))
 
-  ipcMain.handle('vb-local-sync:worker-snapshot', wrap(async localId => withCtl(() => workerCtl.runCtl('snapshot', localId))))
+  ipcMain.handle('vb-local-sync:worker-snapshot', wrap(async localId => workerCtl.runCtl('snapshot', localId)))
 
   ipcMain.handle('vb-local-sync:focus-worker', wrap(async localId => {
+    const t0 = Date.now()
     log('focus-worker request', localId)
     try {
-      const out = await withCtl(() => workerCtl.runCtl('focus', localId))
-      log('focus-worker ok', localId, { hwnd: out.hwnd, pids: out.pids, fg: out.fgAfter || out.fg })
+      const out = await workerCtl.runCtl('focus', localId)
+      log('focus-worker ok', localId, { ms: Date.now() - t0, hwnd: out.hwnd, fg: out.fgAfter || out.fg })
       return out
     } catch (e) {
-      const pids = e.detail && e.detail.parsed && e.detail.parsed.pids
-      log('focus-worker fail', localId, e.detail || String(e))
-      if (!pids || (Array.isArray(pids) && pids.length === 0)) throw new Error('环境未在运行')
-      throw e
+      log('focus-worker fail', localId, { ms: Date.now() - t0, detail: e.detail || String(e) })
+      throw new Error((e && e.message) || '环境未在运行')
     }
   }))
 
   ipcMain.handle('vb-local-sync:stop-worker', wrap(async localId => {
     log('stop-worker request', localId)
-    const out = await withCtl(() => workerCtl.runCtl('stop', localId))
-    log('stop-worker ok', localId, { killed: out.killed, left: out.left })
+    const out = await workerCtl.runCtl('stop', localId)
+    workerCtl.invalidateCache()
+    log('stop-worker ok', localId, out)
     return out
   }))
 
@@ -288,18 +288,28 @@ function install() {
       try { osIds = await workerCtl.listIds() } catch (e) { osIds = [] }
       const before = await uiSnapshot(win)
       const running = osIds.map(String).includes('1')
-      const choices = running ? ['open', 'close', 'open', 'close'] : ['launch']
+      const choices = running ? ['open', 'open', 'xclose'] : ['launch']
       const action = choices[Math.floor(Math.random() * choices.length)]
-      const click = await uiClick(win, action)
+      let click = { ok: true, which: action }
+      if (action === 'xclose') {
+        await workerCtl.runCtl('stop', '1')
+        workerCtl.invalidateCache()
+        click = { ok: true, which: 'xclose' }
+      } else {
+        click = await uiClick(win, action)
+      }
       log('stress click', { i, action, click, osIds, before })
-      await sleep(action === 'launch' ? 5000 : (action === 'close' ? 4000 : 1600))
+      await sleep(action === 'launch' ? 4000 : (action === 'xclose' || action === 'close' ? 1500 : 400))
       let osAfter = []
       try { osAfter = await workerCtl.listIds() } catch (e) { osAfter = [] }
       const after = await uiSnapshot(win)
       const cons = checkConsistent(after, osAfter, action)
       if (!click || !click.ok) cons.problems.push('click-missed:' + ((click && click.reason) || 'unknown'))
       if (action === 'launch' && !osAfter.map(String).includes('1')) cons.problems.push('launch-no-process')
-      if (action === 'close' && osAfter.map(String).includes('1')) cons.problems.push('close-process-left')
+      if (action === 'close' || action === 'xclose') {
+        if (osAfter.map(String).includes('1')) cons.problems.push('close-process-left')
+        if (after && (after.hasOpen || after.hasStop)) cons.problems.push('window-gone-ui-stale')
+      }
       cons.ok = cons.problems.length === 0
       report.push({ i, action, click, before, after, osBefore: osIds, osAfter, cons })
       log('stress round', { i, action, ok: cons.ok, problems: cons.problems, osAfter, after })
@@ -362,6 +372,14 @@ function install() {
     setTimeout(() => clearInterval(hookTimer), 30000)
     await runAutoSync('startup')
     BrowserWindow.getAllWindows().forEach(hookWindow)
+    try { workerCtl.ensureExe() } catch (e) { log('ensureExe', String(e)) }
+    setInterval(() => {
+      workerCtl.listIds().then(ids => {
+        BrowserWindow.getAllWindows().forEach(w => {
+          try { w.webContents.send('vb-local-sync:running', ids) } catch {}
+        })
+      }).catch(() => {})
+    }, 800)
   }).catch(e => log('whenReady error', String(e)))
 
   app.on('before-quit', () => {
