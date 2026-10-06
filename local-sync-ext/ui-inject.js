@@ -93,10 +93,14 @@
     display: flex !important; flex-direction: row !important; align-items: center !important;
     flex-wrap: nowrap !important; gap: 4px !important; width: auto !important;
   }
+  .el-table td.status-col,
+  .el-table th.status-col {
+    min-width: 220px !important; width: 220px !important; overflow: visible !important;
+  }
   .el-table td.actions-cell,
   .el-table th.actions-cell,
   .el-table colgroup col.vb-ls-col-actions {
-    min-width: 130px !important; width: 130px !important;
+    min-width: 120px !important; width: 120px !important;
   }
   .el-table__body, .el-table__header { table-layout: fixed !important; }
   .el-table__body tr { height: 32px !important; }
@@ -437,12 +441,22 @@
       parent.style.flexWrap = 'nowrap'
       parent.style.gap = '4px'
     }
-    const running = /已启动|Launched/i.test((launch.textContent || '').trim()) || launch.classList.contains('is-disabled') || launch.disabled
+    if (!launch.dataset.vbOrig) launch.dataset.vbOrig = /已启动|Launched/i.test((launch.textContent || '').trim()) ? '启动' : ((launch.textContent || '').trim() || '启动')
+    const osRun = !!(window.__vbOsRunningIds && window.__vbOsRunningIds.has(String(id)))
+    const running = osRun
     let openBtn = parent.querySelector('.vb-ls-open-btn')
     let stop = parent.querySelector('.vb-ls-stop-btn')
 
     if (running) {
-      launch.style.display = 'none'
+      // Keep 已启动 visible; 打开/关闭 sit beside it in the wider 启动 column
+      launch.style.display = ''
+      launch.classList.remove('is-disabled')
+      launch.removeAttribute('disabled')
+      launch.style.pointerEvents = 'none'
+      launch.style.opacity = '0.85'
+      if (!/已启动|Launched/i.test((launch.textContent || '').trim())) {
+        launch.textContent = '已启动'
+      }
       if (!openBtn) {
         openBtn = document.createElement('button')
         openBtn.type = 'button'
@@ -456,8 +470,11 @@
           e.preventDefault()
           e.stopPropagation()
           try {
+            await invoke('vb-local-sync:ui-log', { act: 'open-click', id, os: [...(window.__vbOsRunningIds || [])], chrome: [...(window.__vbChromeRunningIds || [])] })
             await invoke('vb-local-sync:focus-worker', id)
+            showToast('已打开环境 ' + id)
           } catch (err) {
+            await invoke('vb-local-sync:ui-log', { act: 'open-fail', id, error: String(err && err.message || err) }).catch(() => {})
             showToast('打开失败: ' + (err.message || err), true)
           }
         })
@@ -476,9 +493,22 @@
           e.stopPropagation()
           stop.disabled = true
           try {
-            await chromeCall('stopBrowser', String(id))
+            await invoke('vb-local-sync:ui-log', { act: 'close-click', id })
+            let chromeErr = null
+            try { await chromeCall('stopBrowser', String(id)) } catch (err) { chromeErr = String(err && err.message || err) }
+            let kill = null
+            try { kill = await invoke('vb-local-sync:stop-worker', id) } catch (err) { kill = { error: String(err && err.message || err) } }
+            await pollOsRunning()
+            if (window.__vbOsRunningIds) window.__vbOsRunningIds.delete(String(id))
+            if (window.__vbChromeRunningIds) window.__vbChromeRunningIds.delete(String(id))
+            enhanceBrowserTable()
+            await invoke('vb-local-sync:ui-log', { act: 'close-done', id, chromeErr, kill, os: [...(window.__vbOsRunningIds || [])] })
+            if (window.__vbOsRunningIds && window.__vbOsRunningIds.has(String(id))) {
+              throw new Error(chromeErr || (kill && kill.error) || '进程仍在运行')
+            }
             showToast('已关闭环境 ' + id)
           } catch (err) {
+            await invoke('vb-local-sync:ui-log', { act: 'close-fail', id, error: String(err && err.message || err) }).catch(() => {})
             showToast('关闭失败: ' + (err.message || err), true)
           } finally {
             stop.disabled = false
@@ -487,6 +517,11 @@
       }
     } else {
       launch.style.display = ''
+      launch.style.pointerEvents = ''
+      launch.style.opacity = ''
+      launch.removeAttribute('disabled')
+      launch.classList.remove('is-disabled')
+      if (launch.dataset.vbOrig) launch.textContent = launch.dataset.vbOrig
       if (openBtn) openBtn.remove()
       if (stop) stop.remove()
     }
@@ -553,15 +588,15 @@
     const table = document.querySelector('.el-table')
     if (!table) return
     // selection, 序号, 名称, 分组, 代理, 备注, 创建时间, 启动, 操作, 常用
-    const widths = [48, 44, 150, 72, 48, 64, 120, 96, 130, 36]
+    const widths = [36, 40, 100, 56, 36, 48, 108, 220, 110, 28]
     const labels = []
     const ths = [...table.querySelectorAll('.el-table__header-wrapper th, .el-table__header th')]
     ths.forEach((th, i) => {
       const label = (th.textContent || '').replace(/\s+/g, ' ').trim()
       labels[i] = label
       let w = widths[i]
-      if (/操作/.test(label)) w = 130
-      if (/启动|Launch/.test(label)) w = 96
+      if (/操作/.test(label)) w = 120
+      if (/启动|Launch/.test(label)) w = 220
       if (/创建时间/.test(label)) {
         w = 120
         if (!th.dataset.vbHead) {
@@ -588,9 +623,14 @@
         if (/操作/.test(labels[i] || '') || i === 8) col.classList.add('vb-ls-col-actions')
       })
     })
+    table.querySelectorAll('td.status-col, th.status-col').forEach(td => {
+      td.style.width = '220px'
+      td.style.minWidth = '220px'
+      td.style.overflow = 'visible'
+    })
     table.querySelectorAll('td.actions-cell, th.actions-cell').forEach(td => {
-      td.style.width = '130px'
-      td.style.minWidth = '130px'
+      td.style.width = '120px'
+      td.style.minWidth = '120px'
     })
   }
 
@@ -607,6 +647,42 @@
       })
     })
   }
+
+  window.__vbOsRunningIds = window.__vbOsRunningIds || new Set()
+  window.__vbChromeRunningIds = window.__vbChromeRunningIds || new Set()
+  function asIds(r) {
+    if (!r) return []
+    if (Array.isArray(r)) {
+      return r.map(x => {
+        if (x && typeof x === 'object') return x.id || x.browserId || x.userId
+        return x
+      }).filter(v => v != null && v !== '')
+    }
+    if (typeof r === 'object') return Object.keys(r).filter(k => r[k])
+    return [r]
+  }
+  async function pollChromeRunning() {
+    try {
+      const r = await chromeCall('getRuningBrowser')
+      window.__vbChromeRunningIds = new Set(asIds(r).map(String))
+    } catch (e) {
+      try { await invoke('vb-local-sync:ui-log', { act: 'chrome-running-fail', error: String(e && e.message || e) }) } catch {}
+    }
+  }
+  async function pollOsRunning() {
+    try {
+      const ids = await invoke('vb-local-sync:running-workers')
+      window.__vbOsRunningIds = new Set((ids || []).map(String))
+    } catch (e) {
+      try { await invoke('vb-local-sync:ui-log', { act: 'os-running-fail', error: String(e && e.message || e) }) } catch {}
+    }
+  }
+  async function pollAll() {
+    await Promise.all([pollOsRunning(), pollChromeRunning()])
+    enhanceBrowserTable()
+  }
+  pollAll()
+  setInterval(pollAll, 4000)
 
   mo.observe(document.body || document.documentElement, { childList: true, subtree: true })
   window.vbLocalSyncEnhanceTable = enhanceBrowserTable

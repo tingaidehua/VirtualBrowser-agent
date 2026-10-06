@@ -23,7 +23,6 @@ function install() {
   }
 
   const { app, ipcMain, dialog, BrowserWindow } = electron
-  const { execFile } = require('child_process')
   if (!app || !ipcMain) {
     log('missing app/ipcMain')
     return
@@ -33,10 +32,18 @@ function install() {
   global.__vbLocalSyncInstalled = true
 
   const core = require('./sync-core')
+  const workerCtl = require('./worker-ctl')
   let syncing = false
   let intervalTimer = null
   let watchTimer = null
   let watchers = []
+  let ctlChain = Promise.resolve()
+
+  function withCtl(fn) {
+    const run = ctlChain.then(fn, fn)
+    ctlChain = run.then(() => {}, () => {})
+    return run
+  }
 
   const wrap = fn => async (_event, ...args) => {
     try {
@@ -143,71 +150,34 @@ function install() {
     return next
   }))
 
-  function workerFocusScript(localId) {
-    const id = String(localId || '').replace(/[^\w.-]/g, '')
-    return `
-$ErrorActionPreference = 'SilentlyContinue'
-Add-Type -TypeDefinition @"
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public class VbWin {
-  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc lpEnumFunc, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-}
-"@
-$pids = @()
-Get-CimInstance Win32_Process -Filter "Name = 'VirtualBrowser.exe'" | ForEach-Object {
-  if ($_.CommandLine -match '--worker-id=${id}(\\D|$)') { $pids += [int]$_.ProcessId }
-}
-if (-not $pids.Count) { Write-Output 'NO_PROCESS'; exit 2 }
-$found = New-Object System.Collections.Generic.List[IntPtr]
-$cb = [VbWin+EnumProc]{
-  param($h, $l)
-  [uint32]$pid = 0
-  [void][VbWin]::GetWindowThreadProcessId($h, [ref]$pid)
-  if ($pids -contains [int]$pid -and [VbWin]::IsWindowVisible($h)) {
-    $sb = New-Object System.Text.StringBuilder 512
-    [void][VbWin]::GetWindowText($h, $sb, 512)
-    if ($sb.ToString().Length -gt 0) { $found.Add($h) }
-  }
-  return $true
-}
-[void][VbWin]::EnumWindows($cb, [IntPtr]::Zero)
-if (-not $found.Count) { Write-Output 'NO_WINDOW'; exit 3 }
-foreach ($h in $found) {
-  if ([VbWin]::IsIconic($h)) { [void][VbWin]::ShowWindow($h, 9) } else { [void][VbWin]::ShowWindow($h, 5) }
-  [void][VbWin]::BringWindowToTop($h)
-  [void][VbWin]::SetForegroundWindow($h)
-}
-Write-Output ('OK ' + $found.Count)
-`
-  }
+  ipcMain.handle('vb-local-sync:ui-log', wrap(async payload => {
+    log('ui', payload)
+    workerCtl.ctlLog('ui', payload)
+    return true
+  }))
 
-  function runPs(script) {
-    return new Promise((resolve, reject) => {
-      execFile(
-        'powershell.exe',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
-        { windowsHide: true, timeout: 8000 },
-        (err, stdout, stderr) => {
-          if (err) return reject(new Error((stderr || stdout || err.message || String(err)).toString().trim()))
-          resolve(String(stdout || '').trim())
-        }
-      )
-    })
-  }
+  ipcMain.handle('vb-local-sync:running-workers', wrap(async () => workerCtl.listIds()))
+
+  ipcMain.handle('vb-local-sync:worker-snapshot', wrap(async localId => withCtl(() => workerCtl.runCtl('snapshot', localId))))
 
   ipcMain.handle('vb-local-sync:focus-worker', wrap(async localId => {
-    const out = await runPs(workerFocusScript(localId))
-    log('focus-worker', localId, out)
+    log('focus-worker request', localId)
+    try {
+      const out = await withCtl(() => workerCtl.runCtl('focus', localId))
+      log('focus-worker ok', localId, { hwnd: out.hwnd, pids: out.pids, fg: out.fgAfter || out.fg })
+      return out
+    } catch (e) {
+      const pids = e.detail && e.detail.parsed && e.detail.parsed.pids
+      log('focus-worker fail', localId, e.detail || String(e))
+      if (!pids || (Array.isArray(pids) && pids.length === 0)) throw new Error('环境未在运行')
+      throw e
+    }
+  }))
+
+  ipcMain.handle('vb-local-sync:stop-worker', wrap(async localId => {
+    log('stop-worker request', localId)
+    const out = await withCtl(() => workerCtl.runCtl('stop', localId))
+    log('stop-worker ok', localId, { killed: out.killed, left: out.left })
     return out
   }))
 
@@ -255,11 +225,105 @@ Write-Output ('OK ' + $found.Count)
     }
   }
 
+  async function sleep(ms) { await new Promise(r => setTimeout(r, ms)) }
+
+  async function uiSnapshot(win) {
+    return win.webContents.executeJavaScript('(function(){var row=document.querySelector(".el-table__body tr");if(!row)return {empty:true};var status=row.querySelector("td.status-col");var btns=[];var list=status?status.querySelectorAll("button,.el-button,.vb-ls-open-btn,.vb-ls-stop-btn"):[];for(var i=0;i<list.length;i++)btns.push((list[i].textContent||"").trim());return {rowText:(row.innerText||"").trim(),statusText:status?(status.innerText||"").trim():"",btns:btns,hasOpen:!!row.querySelector(".vb-ls-open-btn"),hasStop:!!row.querySelector(".vb-ls-stop-btn")};})()', false)
+  }
+
+  async function uiClick(win, which) {
+    const expr = which === 'open'
+      ? '(function(){var b=document.querySelector(".vb-ls-open-btn");if(!b)return {ok:false,reason:"no-btn"};b.click();return {ok:true,which:"open"};})()'
+      : which === 'close'
+        ? '(function(){var b=document.querySelector(".vb-ls-stop-btn");if(!b)return {ok:false,reason:"no-btn"};b.click();return {ok:true,which:"close"};})()'
+        : '(function(){var nodes=document.querySelectorAll("td.status-col button,td.status-col .el-button");var b=null;for(var i=0;i<nodes.length;i++){var t=(nodes[i].textContent||"").trim();if(/启动/.test(t)&&String(nodes[i].className).indexOf("vb-ls-")<0){b=nodes[i];break;}}if(!b)return {ok:false,reason:"no-btn"};b.click();return {ok:true,which:"launch",text:(b.textContent||"").trim()};})()'
+    return win.webContents.executeJavaScript(expr, false)
+  }
+
+  function checkConsistent(ui, osIds, action) {
+    const running = osIds.map(String).includes('1')
+    const problems = []
+    if (running) {
+      if (!ui.hasOpen) problems.push('running-but-no-open')
+      if (!ui.hasStop) problems.push('running-but-no-close')
+      if (!/已启动/.test(ui.statusText || '')) problems.push('running-but-status-not-launched')
+    } else {
+      if (ui.hasOpen) problems.push('stopped-but-has-open')
+      if (ui.hasStop) problems.push('stopped-but-has-close')
+    }
+    return { ok: problems.length === 0, running, problems, action, ui, osIds }
+  }
+
+  async function stressButtons(_ignored) {
+    const flag = path.join(process.env.APPDATA || '', 'virtual-browser', 'selftest-stress')
+    if (global.__vbStressStarted) return
+    if (!fs.existsSync(flag)) return
+    global.__vbStressStarted = true
+    try { fs.unlinkSync(flag) } catch {}
+    const rounds = 6
+    const report = []
+    log('stress start', rounds)
+    workerCtl.ctlLog('stress-start', { rounds })
+    let win = null
+    for (let t = 0; t < 20 && !win; t++) {
+      for (const w of BrowserWindow.getAllWindows()) {
+        try {
+          const n = await w.webContents.executeJavaScript('document.querySelectorAll(".el-table__body tr").length', false)
+          log('stress probe-win', { id: w.id, n, url: w.webContents.getURL() })
+          if (Number(n) > 0) { win = w; break }
+        } catch (e) {
+          log('stress probe-win fail', w.id, String(e))
+        }
+      }
+      if (!win) await sleep(500)
+    }
+    if (!win) {
+      log('stress no table window')
+      workerCtl.ctlLog('stress-no-window')
+      return
+    }
+    try {
+    for (let i = 0; i < rounds; i++) {
+      let osIds = []
+      try { osIds = await workerCtl.listIds() } catch (e) { osIds = [] }
+      const before = await uiSnapshot(win)
+      const running = osIds.map(String).includes('1')
+      const choices = running ? ['open', 'close', 'open', 'close'] : ['launch']
+      const action = choices[Math.floor(Math.random() * choices.length)]
+      const click = await uiClick(win, action)
+      log('stress click', { i, action, click, osIds, before })
+      await sleep(action === 'launch' ? 5000 : (action === 'close' ? 4000 : 1600))
+      let osAfter = []
+      try { osAfter = await workerCtl.listIds() } catch (e) { osAfter = [] }
+      const after = await uiSnapshot(win)
+      const cons = checkConsistent(after, osAfter, action)
+      if (!click || !click.ok) cons.problems.push('click-missed:' + ((click && click.reason) || 'unknown'))
+      if (action === 'launch' && !osAfter.map(String).includes('1')) cons.problems.push('launch-no-process')
+      if (action === 'close' && osAfter.map(String).includes('1')) cons.problems.push('close-process-left')
+      cons.ok = cons.problems.length === 0
+      report.push({ i, action, click, before, after, osBefore: osIds, osAfter, cons })
+      log('stress round', { i, action, ok: cons.ok, problems: cons.problems, osAfter, after })
+      workerCtl.ctlLog('stress-round', report[report.length - 1])
+    }
+    } catch (e) {
+      log('stress crashed', String(e && e.stack || e))
+      workerCtl.ctlLog('stress-crashed', String(e && e.stack || e))
+    }
+    const failed = report.filter(r => !r.cons || !r.cons.ok)
+    const summary = { rounds, ran: report.length, failed: failed.length, failedRounds: failed.map(r => ({ i: r.i, action: r.action, problems: r.cons && r.cons.problems })) }
+    log('stress done', summary)
+    workerCtl.ctlLog('stress-done', summary)
+    try {
+      fs.writeFileSync(path.join(process.env.APPDATA || '', 'virtual-browser', 'logs', 'stress-report.json'), JSON.stringify({ summary, report }, null, 2))
+    } catch {}
+  }
+
   const injectUi = async win => {
     try {
       await win.webContents.executeJavaScript(uiSource(), true)
       log('ui injected', win.id)
       setTimeout(() => probeTable(win), 2500)
+      setTimeout(() => stressButtons(win), 5000)
     } catch (e) {
       log('ui inject failed', String(e))
     }
