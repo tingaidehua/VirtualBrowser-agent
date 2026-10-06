@@ -1,0 +1,1 @@
+Get-CimInstance Win32_Process -Filter "Name = 'VirtualBrowser.exe'" | Where-Object { $_.CommandLine -match '--worker-id=1(\D|$)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

@@ -1,0 +1,16 @@
+# Extracted asar runtime (huge); keep only our local-sync patch
+_asar_extract/node_modules/
+_asar_extract/dist/app/*.node
+_asar_extract/dist/app/app.jsc
+_asar_extract/dist/app/preload.jsc
+
+# Local debug artifacts
+tools/*.png
+tools/*.log
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+node_modules/
