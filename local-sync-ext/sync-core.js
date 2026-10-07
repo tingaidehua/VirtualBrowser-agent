@@ -115,13 +115,24 @@ function loadGlobal() {
   return readJson(globalPath(), {})
 }
 
+const SKIP_DIR_NAMES = new Set([
+  'Cache', 'Code Cache', 'GPUCache', 'GrShaderCache', 'GraphiteDawnCache', 'ShaderCache',
+  'Service Worker', 'blob_storage', 'Crashpad', 'BrowserMetrics', 'optimization_guide_model_store',
+  'Crowd Deny', 'CertificateRevocation', 'Safe Browsing', 'component_crx_cache',
+  'JumpListIconsRecentClosed', 'JumpListIconsOld', 'JumpListIcons', 'File System',
+  'Platform Notifications', 'VideoDecodeStats', 'Shared Dictionary', 'segmentation_platform'
+])
+const SKIP_FILE_NAMES = new Set([
+  'lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket', 'LOCK', 'LOG', 'LOG.old'
+])
+
 function dirStats(dir) {
   let total = 0
   let newest = 0
   if (!fs.existsSync(dir)) return { size: 0, mtimeMs: 0 }
   const walk = d => {
     for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
-      if (['lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket'].includes(ent.name)) continue
+      if (SKIP_FILE_NAMES.has(ent.name) || SKIP_DIR_NAMES.has(ent.name)) continue
       const p = path.join(d, ent.name)
       if (ent.isDirectory()) walk(p)
       else {
@@ -141,8 +152,8 @@ function dirSize(dir) {
   return dirStats(dir).size
 }
 
-function fingerprintEnv(user, workerDir) {
-  const st = dirStats(workerDir)
+function fingerprintEnv(user, workerDir, stOpt) {
+  const st = stOpt || dirStats(workerDir)
   const name = user && user.name != null ? user.name : ''
   const remark = user && user.remark != null ? user.remark : ''
   const group = JSON.stringify((user && user.group) || [])
@@ -154,7 +165,7 @@ async function copyDir(src, dest) {
   ensureDir(dest)
   let copied = 0
   for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
-    if (['lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket'].includes(ent.name)) continue
+    if (SKIP_FILE_NAMES.has(ent.name) || SKIP_DIR_NAMES.has(ent.name)) continue
     const s = path.join(src, ent.name)
     const d = path.join(dest, ent.name)
     if (ent.isDirectory()) {
@@ -206,7 +217,8 @@ async function listLocalEnvironments() {
     const syncedMeta = syncId && fs.existsSync(path.join(layout.envs, syncId, 'meta.json'))
       ? readJson(path.join(layout.envs, syncId, 'fp.json'), null)
       : null
-    const fp = fingerprintEnv(u, workerDir)
+    const st = dirStats(workerDir)
+    const fp = fingerprintEnv(u, workerDir, st)
     return {
       id: u.id,
       name: u.name || String(u.id),
@@ -217,7 +229,7 @@ async function listLocalEnvironments() {
       syncEnabled: true,
       synced: !!syncedMeta,
       dirty: !syncedMeta || syncedMeta.fp !== fp,
-      size: dirSize(workerDir),
+      size: st.size,
       updatedAt: u.updatedAt || u.createdAt || null,
       workerExists: fs.existsSync(workerDir)
     }
@@ -257,9 +269,12 @@ async function uploadEnvironment(localId, syncPath) {
   const user = (profiles.users || []).find(u => String(u.id) === String(localId))
   if (!user) throw new Error('本地环境不存在: ' + localId)
 
+  const hadSyncId = !!user.localSyncId
   ensureLocalSyncId(user)
-  user.updatedAt = Date.now()
-  saveProfiles(profiles)
+  if (!hadSyncId) {
+    user.updatedAt = Date.now()
+    saveProfiles(profiles)
+  }
 
   const global = loadGlobal()
   const workers = workersRoot(global)
@@ -268,12 +283,25 @@ async function uploadEnvironment(localId, syncPath) {
   const syncId = syncIdFor(user)
   const destEnv = path.join(layout.envs, syncId)
   const destWorker = path.join(destEnv, 'worker')
+  const fp = fingerprintEnv(user, workerSrc)
+  const prevFp = readJson(path.join(destEnv, 'fp.json'), null)
+  if (prevFp && prevFp.fp === fp && fs.existsSync(destWorker)) {
+    return {
+      syncId,
+      localId: user.id,
+      name: user.name || String(user.id),
+      remark: user.remark || '',
+      updatedAt: prevFp.updatedAt || Date.now(),
+      size: dirSize(destWorker),
+      skipped: true
+    }
+  }
 
   await removeDir(destWorker)
   ensureDir(destEnv)
   writeJson(path.join(destEnv, 'meta.json'), user)
   writeJson(path.join(destEnv, 'fp.json'), {
-    fp: fingerprintEnv(user, workerSrc),
+    fp,
     updatedAt: Date.now()
   })
   if (fs.existsSync(workerSrc)) await copyDir(workerSrc, destWorker)
@@ -431,7 +459,7 @@ async function autoSyncNow(syncPath) {
   const target = syncPath || cfg.syncPath
   ensureDir(target)
   const pulled = await autoLoadFromSync(target)
-  const uploaded = await uploadChanged(target)
+  const uploaded = (await uploadChanged(target)).filter(x => !x.skipped)
   // always mirror latest virtual/global
   try {
     const layout = syncLayout(target)

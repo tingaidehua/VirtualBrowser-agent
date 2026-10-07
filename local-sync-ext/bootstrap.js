@@ -37,6 +37,7 @@ function install() {
   let intervalTimer = null
   let watchTimer = null
   let watchers = []
+  let ignoreWatchUntil = 0
   let ctlChain = Promise.resolve()
 
   function withCtl(fn) {
@@ -64,6 +65,9 @@ function install() {
       log('auto sync busy, skip', reason)
       return { busy: true }
     }
+    if (String(reason).startsWith('watch:') && Date.now() < ignoreWatchUntil) {
+      return { skipped: true, reason: 'watch-cooldown' }
+    }
     syncing = true
     try {
       log('auto sync start', reason)
@@ -75,6 +79,8 @@ function install() {
       return { error: String(e && e.message || e) }
     } finally {
       syncing = false
+      // own writes / chrome noise should not immediately re-trigger sync
+      ignoreWatchUntil = Date.now() + 45000
     }
   }
 
@@ -99,7 +105,7 @@ function install() {
           clearTimeout(watchTimer)
           watchTimer = setTimeout(() => {
             runAutoSync('watch:' + base)
-          }, 5000)
+          }, 20000)
         })
         watchers.push(w)
       } catch (e) {
@@ -260,7 +266,7 @@ function install() {
     if (!fs.existsSync(flag)) return
     global.__vbStressStarted = true
     try { fs.unlinkSync(flag) } catch {}
-    const rounds = 6
+    const rounds = 12
     const report = []
     log('stress start', rounds)
     workerCtl.ctlLog('stress-start', { rounds })
@@ -288,7 +294,7 @@ function install() {
       try { osIds = await workerCtl.listIds() } catch (e) { osIds = [] }
       const before = await uiSnapshot(win)
       const running = osIds.map(String).includes('1')
-      const choices = running ? ['open', 'open', 'xclose'] : ['launch']
+      const choices = running ? ['open', 'open', 'close', 'xclose'] : ['launch']
       const action = choices[Math.floor(Math.random() * choices.length)]
       let click = { ok: true, which: action }
       if (action === 'xclose') {
@@ -299,13 +305,25 @@ function install() {
         click = await uiClick(win, action)
       }
       log('stress click', { i, action, click, osIds, before })
-      await sleep(action === 'launch' ? 4000 : (action === 'xclose' || action === 'close' ? 1500 : 400))
+      await sleep(action === 'launch' ? 4500 : (action === 'xclose' || action === 'close' ? 2000 : 500))
+      workerCtl.invalidateCache()
       let osAfter = []
       try { osAfter = await workerCtl.listIds() } catch (e) { osAfter = [] }
+      // give UI a beat to reflect OS state
+      await sleep(400)
       const after = await uiSnapshot(win)
       const cons = checkConsistent(after, osAfter, action)
       if (!click || !click.ok) cons.problems.push('click-missed:' + ((click && click.reason) || 'unknown'))
       if (action === 'launch' && !osAfter.map(String).includes('1')) cons.problems.push('launch-no-process')
+      if (action === 'open' && osAfter.map(String).includes('1')) {
+        try {
+          const snap = await workerCtl.runCtl('snapshot', '1')
+          const hit = (snap.hits || [])[0]
+          if (!hit) cons.problems.push('open-no-hwnd')
+        } catch (e) {
+          cons.problems.push('open-snapshot-fail')
+        }
+      }
       if (action === 'close' || action === 'xclose') {
         if (osAfter.map(String).includes('1')) cons.problems.push('close-process-left')
         if (after && (after.hasOpen || after.hasStop)) cons.problems.push('window-gone-ui-stale')
@@ -328,10 +346,87 @@ function install() {
     } catch {}
   }
 
+  async function probeLayout(win) {
+    const flag = path.join(process.env.APPDATA || '', 'virtual-browser', 'selftest-layout')
+    if (!fs.existsSync(flag)) return
+    try { fs.unlinkSync(flag) } catch {}
+    try {
+      await win.webContents.executeJavaScript(`(() => {
+        if (window.vbLocalSyncOpen) window.vbLocalSyncOpen();
+        return true;
+      })()`, true)
+      await sleep(800)
+      const info = await win.webContents.executeJavaScript(`(() => {
+        function brief(el){
+          if(!el) return null;
+          return {
+            tag: el.tagName,
+            id: el.id || '',
+            cls: String(el.className || '').slice(0,160),
+            text: (el.textContent || '').replace(/\\s+/g,' ').trim().slice(0,48),
+            rect: (function(){var r=el.getBoundingClientRect(); return {x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)};})()
+          };
+        }
+        var cloud=null;
+        document.querySelectorAll('li,.el-menu-item,span,a,div').forEach(function(el){
+          var t=(el.textContent||'').replace(/\\s+/g,' ').trim();
+          if(!cloud && (t==='云同步' || t==='Cloud Sync')) cloud=el;
+        });
+        var cloudLi = cloud && (cloud.closest('li') || cloud.closest('.el-menu-item') || cloud);
+        var parent = cloudLi && cloudLi.parentElement;
+        var hosts = ['.app-main','.el-main','.main-container','#app .main-container','.router-view','.app-container','[class*=\"app-main\"]','main'].map(function(s){
+          return {sel:s, el:brief(document.querySelector(s))};
+        });
+        var banner=null;
+        document.querySelectorAll('div,section,main').forEach(function(el){
+          var t=(el.textContent||'').trim();
+          if(!banner && t.indexOf('请登录后使用云同步')>=0 && t.length<120) banner=el;
+        });
+        var chain=[]; var n=banner||document.querySelector('.app-main')||document.querySelector('.el-main');
+        for(var i=0;n && i<10;i++){ chain.push(brief(n)); n=n.parentElement; }
+        var localNest = document.querySelector('.vb-ls-nest-menu');
+        var root = document.querySelector('.vb-ls-root');
+        var appContainer = document.querySelector('.app-container');
+        var menuColors = [].slice.call(document.querySelectorAll('.sidebar-container .nest-menu')).map(function(n){
+          var li = n.querySelector('.el-menu-item,li');
+          var cs = li ? getComputedStyle(li) : null;
+          return {
+            text: (n.textContent||'').replace(/\\s+/g,' ').trim().slice(0,20),
+            color: cs && cs.color,
+            style: li ? (li.getAttribute('style')||'').slice(0,120) : '',
+            active: !!(li && li.classList.contains('is-active'))
+          };
+        });
+        return {
+          cloud: brief(cloud),
+          localNest: brief(localNest),
+          localNestParent: brief(localNest && localNest.parentElement),
+          localNestHtml: localNest ? localNest.outerHTML.slice(0,400) : null,
+          siblingsInSubmenu: localNest && localNest.parentElement ? [].slice.call(localNest.parentElement.children).map(function(c){return (c.textContent||'').replace(/\\s+/g,' ').trim().slice(0,20);}) : [],
+          menuColors: menuColors,
+          root: brief(root),
+          rootParent: brief(root && root.parentElement),
+          rootOpen: !!(root && root.classList.contains('open')),
+          navbar: brief(document.querySelector('.navbar,.el-header,header,[class*=\"navbar\"]')),
+          sidebar: brief(document.querySelector('.sidebar-container,.el-aside,[class*=\"sidebar\"]')),
+          appContainer: brief(appContainer),
+          hideMain: document.documentElement.classList.contains('vb-ls-hide-main'),
+          hosts: hosts
+        };
+      })()`, true)
+      const out = path.join(process.env.APPDATA || '', 'virtual-browser', 'logs', 'layout-probe.json')
+      fs.writeFileSync(out, JSON.stringify(info, null, 2))
+      log('layout-probe', info)
+    } catch (e) {
+      log('layout-probe failed', String(e))
+    }
+  }
+
   const injectUi = async win => {
     try {
       await win.webContents.executeJavaScript(uiSource(), true)
       log('ui injected', win.id)
+      setTimeout(() => probeLayout(win), 1500)
       setTimeout(() => probeTable(win), 2500)
       setTimeout(() => stressButtons(win), 5000)
     } catch (e) {
@@ -379,7 +474,7 @@ function install() {
           try { w.webContents.send('vb-local-sync:running', ids) } catch {}
         })
       }).catch(() => {})
-    }, 800)
+    }, 2500)
   }).catch(e => log('whenReady error', String(e)))
 
   app.on('before-quit', () => {

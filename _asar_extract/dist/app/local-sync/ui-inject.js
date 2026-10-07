@@ -21,14 +21,23 @@
   }
 
   const css = `
-  .vb-ls-hide-main #app > * { visibility: hidden !important; }
-  .vb-ls-root { position: fixed; inset: 0; z-index: 99999; display:none; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif; }
-  .vb-ls-root.open { display:block; }
-  .vb-ls-shell { position:absolute; left: 210px; right: 0; top: 0; bottom: 0; background: #f5f7fa; display:flex; flex-direction:column; }
-  .vb-ls-top { height: 50px; background:#fff; border-bottom:1px solid #ebeef5; display:flex; align-items:center; padding:0 20px; gap:12px; }
+  .vb-ls-root {
+    display:none; position:absolute; inset:0; z-index:5;
+    background:#f5f7fa; flex-direction:column;
+    font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  .vb-ls-root.open { display:flex !important; }
+  .vb-ls-shell { flex:1; min-height:0; display:flex; flex-direction:column; background:#f5f7fa; }
+  .vb-ls-top { height:48px; flex:0 0 auto; background:#fff; border-bottom:1px solid #ebeef5; display:flex; align-items:center; padding:0 20px; gap:12px; }
   .vb-ls-top h1 { font-size:16px; margin:0; font-weight:600; color:#303133; }
   .vb-ls-top .sp { flex:1; }
-  .vb-ls-body { flex:1; overflow:auto; padding:16px 20px; }
+  .vb-ls-body { flex:1; min-height:0; overflow:auto; padding:16px 20px; }
+  .vb-ls-nest-menu .el-menu-item { height:50px !important; line-height:50px !important; }
+  /* keep sidebar labels readable after we toggle active state */
+  .sidebar-container .nest-menu .el-menu-item { color: #bfcbd9 !important; }
+  .sidebar-container .nest-menu .el-menu-item.is-active { color: #409eff !important; }
+  .sidebar-container .nest-menu .el-menu-item i,
+  .sidebar-container .nest-menu .el-menu-item .svg-icon { color: inherit !important; fill: currentColor; }
   .vb-ls-card { background:#fff; border-radius:8px; padding:16px; margin-bottom:16px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
   .vb-ls-row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
   .vb-ls-input { flex:1; min-width:280px; height:32px; border:1px solid #dcdfe6; border-radius:4px; padding:0 10px; }
@@ -50,9 +59,6 @@
   .vb-ls-toast.show { display:block; }
   .vb-ls-toast.err { background:#f56c6c; }
   .vb-ls-check { margin-right:8px; }
-  .vb-ls-sidebar-item { display:flex !important; align-items:center; gap:8px; padding:0 20px; height:50px; cursor:pointer; color:#bfcbd9; font-size:14px; }
-  .vb-ls-sidebar-item:hover, .vb-ls-sidebar-item.active { color:#409eff; background: rgba(64,158,255,.08); }
-  .vb-ls-sidebar-item .ico { width:18px; text-align:center; }
   /* compact env list: row just taller than buttons */
   .el-table { font-size: 12px !important; }
   .el-table .el-table__cell { padding: 0 !important; }
@@ -95,7 +101,17 @@
   }
   .el-table td.status-col,
   .el-table th.status-col {
-    min-width: 220px !important; width: 220px !important; overflow: visible !important;
+    min-width: 200px !important; width: 200px !important; overflow: visible !important;
+  }
+  /* hide caret / loading triangle inside 启动/已启动 */
+  .el-table td.status-col .el-button > i,
+  .el-table td.status-col .el-button > .el-icon,
+  .el-table td.status-col .el-button .el-icon-arrow-down,
+  .el-table td.status-col .el-button .el-icon-arrow-up,
+  .el-table td.status-col .el-button .el-icon-loading,
+  .el-table td.status-col .el-button .el-icon-more,
+  .el-table td.status-col .el-dropdown__caret-button {
+    display: none !important;
   }
   .el-table td.actions-cell,
   .el-table th.actions-cell,
@@ -150,7 +166,6 @@
         <div class="sp"></div>
         <button class="vb-ls-btn primary" data-act="sync-now">立即同步</button>
         <button class="vb-ls-btn" data-act="refresh">刷新</button>
-        <button class="vb-ls-btn" data-act="close">返回</button>
       </div>
       <div class="vb-ls-body">
         <div class="vb-ls-card">
@@ -184,9 +199,82 @@
       </div>
     </div>
   `
-  document.documentElement.appendChild(root)
+  const state = { settings: null, local: [], synced: [], busy: false, host: null, open: false }
 
-  const state = { settings: null, local: [], synced: [], busy: false }
+  function findContentHost() {
+    return document.querySelector('.app-main .app-container')
+      || document.querySelector('.app-container')
+      || document.querySelector('.app-main')
+      || document.querySelector('.main-container')
+  }
+
+  function mountIntoContent() {
+    const host = findContentHost()
+    if (!host) return null
+    const cs = window.getComputedStyle(host)
+    if (cs.position === 'static') host.style.position = 'relative'
+    if (root.parentElement !== host) host.appendChild(root)
+    state.host = host
+    return host
+  }
+
+  function hideHostSiblings(host) {
+    if (!host) return
+    ;[...host.children].forEach(ch => {
+      if (ch === root) return
+      if (ch.dataset.vbLsHidden === '1') return
+      ch.dataset.vbLsHidden = '1'
+      ch.dataset.vbLsPrevDisplay = ch.style.display || ''
+      ch.style.display = 'none'
+    })
+  }
+
+  function restoreHostSiblings(host) {
+    if (!host) return
+    ;[...host.querySelectorAll('[data-vb-ls-hidden="1"]')].forEach(ch => {
+      ch.style.display = ch.dataset.vbLsPrevDisplay || ''
+      delete ch.dataset.vbLsHidden
+      delete ch.dataset.vbLsPrevDisplay
+    })
+  }
+
+  function setBreadcrumbLocal() {
+    const bar = document.querySelector('.navbar .el-breadcrumb, .navbar')
+    if (!bar) return
+    const items = bar.querySelectorAll('.el-breadcrumb__inner, .no-redirect, span')
+    for (const el of items) {
+      const t = (el.textContent || '').trim()
+      if (/云同步|环境列表|常用环境|分组管理|Cloud Sync|Settings|设置/.test(t) && t.length < 20) {
+        el.dataset.vbLsPrevText = el.dataset.vbLsPrevText || t
+        el.textContent = '本地同步'
+      }
+    }
+  }
+
+  const SIDEBAR_TEXT = 'rgb(191, 203, 217)'
+  const SIDEBAR_ACTIVE = 'rgb(64, 158, 255)'
+
+  function paintMenuItem(li, active) {
+    if (!li) return
+    if (active) {
+      li.classList.add('is-active')
+      li.style.setProperty('color', SIDEBAR_ACTIVE, 'important')
+    } else {
+      li.classList.remove('is-active')
+      li.style.setProperty('color', SIDEBAR_TEXT, 'important')
+    }
+  }
+
+  function clearMenuActive() {
+    document.querySelectorAll('.sidebar-container .nest-menu .el-menu-item').forEach(li => {
+      if (li.closest('.vb-ls-nest-menu')) return
+      paintMenuItem(li, false)
+    })
+    document.querySelectorAll('.sidebar-container a.router-link-exact-active, .sidebar-container a.router-link-active').forEach(a => {
+      if (a.closest('.vb-ls-nest-menu')) return
+      a.classList.remove('router-link-exact-active', 'router-link-active')
+    })
+  }
 
   function fmtSize(n) {
     n = Number(n) || 0
@@ -261,27 +349,46 @@
     }
   }
 
+  function markSidebar(active) {
+    const nest = document.querySelector('.vb-ls-nest-menu')
+    if (!nest) return
+    const a = nest.querySelector('a')
+    const li = nest.querySelector('.el-menu-item, li')
+    if (active) {
+      clearMenuActive()
+      if (a) a.classList.add('router-link-active', 'router-link-exact-active')
+      paintMenuItem(li, true)
+    } else {
+      if (a) a.classList.remove('router-link-active', 'router-link-exact-active')
+      paintMenuItem(li, false)
+    }
+  }
+
   function openPage() {
+    const host = mountIntoContent()
+    if (!host) {
+      showToast('未找到主内容区', true)
+      return
+    }
+    hideHostSiblings(host)
     root.classList.add('open')
-    document.documentElement.classList.add('vb-ls-hide-main')
+    state.open = true
     markSidebar(true)
+    setBreadcrumbLocal()
+    try { history.replaceState(null, '', '#/vb-local-sync') } catch {}
     refresh().catch(e => showToast(String(e.message || e), true))
   }
   function closePage() {
     root.classList.remove('open')
-    document.documentElement.classList.remove('vb-ls-hide-main')
+    state.open = false
+    restoreHostSiblings(state.host || findContentHost())
     markSidebar(false)
-  }
-  function markSidebar(active) {
-    const el = document.querySelector('.vb-ls-sidebar-item')
-    if (el) el.classList.toggle('active', !!active)
   }
 
   root.addEventListener('click', e => {
     const btn = e.target.closest('button')
     if (!btn) return
     const act = btn.getAttribute('data-act')
-    if (act === 'close') return closePage()
     if (act === 'refresh') return withBusy(async () => {})
     if (act === 'sync-now') {
       return withBusy(async () => {
@@ -310,40 +417,58 @@
     }
   })
 
-  function findCloudSyncMenuItem() {
-    const texts = ['云同步', 'Cloud Sync']
-    const all = document.querySelectorAll('li, a, div, span')
-    for (const el of all) {
-      const t = (el.textContent || '').trim()
-      if (texts.includes(t) && el.children.length <= 3) {
-        return el.closest('li') || el.closest('.menu-wrapper') || el.closest('.el-menu-item') || el
-      }
-    }
-    for (const el of all) {
-      const t = (el.textContent || '').trim()
-      if ((t === '云同步' || t.startsWith('云同步')) && t.length < 20) return el.closest('li') || el
+  function findCloudNestMenu() {
+    const nests = document.querySelectorAll('.sidebar-container .nest-menu, .el-menu .nest-menu')
+    for (const nest of nests) {
+      const t = (nest.textContent || '').replace(/\s+/g, ' ').trim()
+      if (t === '云同步' || t === 'Cloud Sync') return nest
     }
     return null
   }
 
   function injectSidebar() {
-    if (document.querySelector('.vb-ls-sidebar-item')) return true
-    const cloud = findCloudSyncMenuItem()
-    if (!cloud) return false
-    const item = document.createElement('div')
-    item.className = 'vb-ls-sidebar-item'
-    item.innerHTML = '<span class="ico">LS</span><span>本地同步</span>'
-    item.addEventListener('click', e => {
+    // remove old wrong-level item
+    document.querySelectorAll('.vb-ls-sidebar-item').forEach(n => n.remove())
+    if (document.querySelector('.vb-ls-nest-menu')) return true
+    const cloud = findCloudNestMenu()
+    if (!cloud || !cloud.parentElement) return false
+    const nest = cloud.cloneNode(true)
+    nest.classList.add('vb-ls-nest-menu')
+    const a = nest.querySelector('a')
+    if (a) {
+      a.setAttribute('href', '#/vb-local-sync')
+      a.classList.remove('router-link-exact-active', 'router-link-active')
+    }
+    const li = nest.querySelector('.el-menu-item, li[role="menuitem"]')
+    if (li) {
+      li.style.backgroundColor = 'rgb(48, 65, 86)'
+      paintMenuItem(li, false)
+      const span = li.querySelector('span')
+      if (span) span.textContent = '本地同步'
+      else li.appendChild(document.createTextNode('本地同步'))
+    }
+    nest.addEventListener('click', e => {
       e.preventDefault()
       e.stopPropagation()
       openPage()
-    })
-    if (cloud.parentElement) {
-      if (cloud.nextSibling) cloud.parentElement.insertBefore(item, cloud.nextSibling)
-      else cloud.parentElement.appendChild(item)
-    } else cloud.after(item)
+    }, true)
+    cloud.parentElement.insertBefore(nest, cloud.nextSibling)
     return true
   }
+
+  // leave local-sync when user navigates other sidebar routes
+  window.addEventListener('hashchange', () => {
+    if (!state.open) return
+    const h = String(location.hash || '')
+    if (h.indexOf('vb-local-sync') < 0) closePage()
+  })
+  document.addEventListener('click', e => {
+    if (!state.open) return
+    const nest = e.target.closest && e.target.closest('.vb-ls-nest-menu')
+    if (nest) return
+    const other = e.target.closest && e.target.closest('.sidebar-container .nest-menu a, .sidebar-container .el-menu-item')
+    if (other) closePage()
+  }, true)
 
   function enhanceSettingsPage() {
     if (document.querySelector('.vb-ls-settings-block')) return
@@ -384,19 +509,33 @@
   }
 
   let tries = 0
+  let enhanceBusy = false
+  let enhanceTimer = null
+  function scheduleEnhance(ms) {
+    if (enhanceTimer) clearTimeout(enhanceTimer)
+    enhanceTimer = setTimeout(() => {
+      enhanceTimer = null
+      if (enhanceBusy) return
+      enhanceBusy = true
+      try {
+        injectSidebar()
+        enhanceSettingsPage()
+        enhanceBrowserTable()
+      } finally {
+        enhanceBusy = false
+      }
+    }, ms == null ? 120 : ms)
+  }
   const timer = setInterval(() => {
     tries++
-    injectSidebar()
-    enhanceSettingsPage()
-    enhanceBrowserTable()
-    if (tries > 60) clearInterval(timer)
-  }, 500)
+    scheduleEnhance(0)
+    if (tries > 40) clearInterval(timer)
+  }, 800)
   const mo = new MutationObserver(() => {
-    injectSidebar()
-    enhanceSettingsPage()
-    enhanceBrowserTable()
+    if (enhanceBusy) return
+    scheduleEnhance(250)
   })
-  mo.observe(document.body || document.documentElement, { childList: true, subtree: true })
+  mo.observe(document.body || document.documentElement, { childList: true, subtree: false })
 
   window.vbLocalSyncOpen = openPage
 
@@ -424,6 +563,14 @@
     return ''
   }
 
+  function stripLaunchDecor(launch) {
+    if (!launch) return
+    ;[...launch.querySelectorAll('i, svg, .el-icon, .el-icon-arrow-down, .el-icon-arrow-up, .el-icon-loading, .el-icon-more')].forEach(n => n.remove())
+    // keep plain text label only
+    const t = (launch.textContent || '').replace(/\s+/g, ' ').trim()
+    if (t && launch.childNodes.length !== 1) launch.textContent = t
+  }
+
   function enhanceLaunchCell(tr) {
     const btns = [...tr.querySelectorAll('button.el-button, .el-button')]
     const launch = btns.find(b =>
@@ -444,19 +591,18 @@
     if (!launch.dataset.vbOrig) launch.dataset.vbOrig = /已启动|Launched/i.test((launch.textContent || '').trim()) ? '启动' : ((launch.textContent || '').trim() || '启动')
     const osRun = !!(window.__vbOsRunningIds && window.__vbOsRunningIds.has(String(id)))
     const running = osRun
-    let openBtn = parent.querySelector('.vb-ls-open-btn')
-    let stop = parent.querySelector('.vb-ls-stop-btn')
+    let openBtn = parent && parent.querySelector('.vb-ls-open-btn')
+    let stop = parent && parent.querySelector('.vb-ls-stop-btn')
+    stripLaunchDecor(launch)
 
     if (running) {
-      // Keep 已启动 visible; 打开/关闭 sit beside it in the wider 启动 column
       launch.style.display = ''
       launch.classList.remove('is-disabled')
       launch.removeAttribute('disabled')
       launch.style.pointerEvents = 'none'
-      launch.style.opacity = '0.85'
-      if (!/已启动|Launched/i.test((launch.textContent || '').trim())) {
-        launch.textContent = '已启动'
-      }
+      launch.style.opacity = '0.9'
+      launch.style.cursor = 'default'
+      launch.textContent = '已启动'
       if (!openBtn) {
         openBtn = document.createElement('button')
         openBtn.type = 'button'
@@ -470,7 +616,7 @@
           e.preventDefault()
           e.stopPropagation()
           try {
-            await invoke('vb-local-sync:ui-log', { act: 'open-click', id, os: [...(window.__vbOsRunningIds || [])], chrome: [...(window.__vbChromeRunningIds || [])] })
+            await invoke('vb-local-sync:ui-log', { act: 'open-click', id, os: [...(window.__vbOsRunningIds || [])] })
             await invoke('vb-local-sync:focus-worker', id)
             showToast('已打开环境 ' + id)
           } catch (err) {
@@ -500,8 +646,7 @@
             try { kill = await invoke('vb-local-sync:stop-worker', id) } catch (err) { kill = { error: String(err && err.message || err) } }
             await pollOsRunning()
             if (window.__vbOsRunningIds) window.__vbOsRunningIds.delete(String(id))
-            if (window.__vbChromeRunningIds) window.__vbChromeRunningIds.delete(String(id))
-            enhanceBrowserTable()
+            scheduleEnhance(0)
             await invoke('vb-local-sync:ui-log', { act: 'close-done', id, chromeErr, kill, os: [...(window.__vbOsRunningIds || [])] })
             if (window.__vbOsRunningIds && window.__vbOsRunningIds.has(String(id))) {
               throw new Error(chromeErr || (kill && kill.error) || '进程仍在运行')
@@ -519,6 +664,7 @@
       launch.style.display = ''
       launch.style.pointerEvents = ''
       launch.style.opacity = ''
+      launch.style.cursor = ''
       launch.removeAttribute('disabled')
       launch.classList.remove('is-disabled')
       if (launch.dataset.vbOrig) launch.textContent = launch.dataset.vbOrig
@@ -588,7 +734,7 @@
     const table = document.querySelector('.el-table')
     if (!table) return
     // selection, 序号, 名称, 分组, 代理, 备注, 创建时间, 启动, 操作, 常用
-    const widths = [36, 40, 100, 56, 36, 48, 108, 220, 110, 28]
+    const widths = [36, 40, 100, 56, 36, 48, 108, 200, 110, 28]
     const labels = []
     const ths = [...table.querySelectorAll('.el-table__header-wrapper th, .el-table__header th')]
     ths.forEach((th, i) => {
@@ -596,7 +742,7 @@
       labels[i] = label
       let w = widths[i]
       if (/操作/.test(label)) w = 120
-      if (/启动|Launch/.test(label)) w = 220
+      if (/启动|Launch/.test(label)) w = 200
       if (/创建时间/.test(label)) {
         w = 120
         if (!th.dataset.vbHead) {
@@ -624,8 +770,8 @@
       })
     })
     table.querySelectorAll('td.status-col, th.status-col').forEach(td => {
-      td.style.width = '220px'
-      td.style.minWidth = '220px'
+      td.style.width = '200px'
+      td.style.minWidth = '200px'
       td.style.overflow = 'visible'
     })
     table.querySelectorAll('td.actions-cell, th.actions-cell').forEach(td => {
@@ -675,22 +821,34 @@
       window.__vbOsRunningIds = new Set((ids || []).map(String))
     } catch (e) {}
   }
+  let lastOsKey = ''
   try {
     const r = ipc()
     if (r && r.on) {
       r.on('vb-local-sync:running', (_e, ids) => {
-        window.__vbOsRunningIds = new Set((ids || []).map(String))
-        enhanceBrowserTable()
+        const next = (ids || []).map(String)
+        window.__vbOsRunningIds = new Set(next)
+        const key = next.slice().sort().join(',')
+        if (key !== lastOsKey) {
+          lastOsKey = key
+          scheduleEnhance(0)
+        }
       })
     }
   } catch {}
-  pollOsRunning().then(() => enhanceBrowserTable())
-  setInterval(() => { pollOsRunning().then(() => enhanceBrowserTable()) }, 1000)
+  pollOsRunning().then(() => scheduleEnhance(0))
+  setInterval(() => {
+    pollOsRunning().then(() => {
+      const key = [...(window.__vbOsRunningIds || [])].sort().join(',')
+      if (key !== lastOsKey) {
+        lastOsKey = key
+        scheduleEnhance(0)
+      }
+    })
+  }, 3000)
 
-  mo.observe(document.body || document.documentElement, { childList: true, subtree: true })
   window.vbLocalSyncEnhanceTable = enhanceBrowserTable
-  setInterval(enhanceBrowserTable, 800)
-  setTimeout(enhanceBrowserTable, 400)
+  setTimeout(() => scheduleEnhance(0), 400)
   setTimeout(() => {
     try {
       const fs = (window.require && window.require('fs')) || null
@@ -709,6 +867,6 @@
     } catch (e) {}
   }, 2500)
 
-  console.log('[local-sync] UI ready (list compact + open/stop)')
+  console.log('[local-sync] UI ready (list compact)')
 })();
 

@@ -13,10 +13,23 @@ let proc = null
 let buf = ''
 let waiters = []
 
+let lastErrLog = 0
 function ctlLog(...args) {
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true })
+    try {
+      const st = fs.statSync(LOG_FILE)
+      if (st.size > 2 * 1024 * 1024) {
+        const keep = fs.readFileSync(LOG_FILE, 'utf8').slice(-400000)
+        fs.writeFileSync(LOG_FILE, keep)
+      }
+    } catch {}
     const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')
+    if (/list-ids-error/.test(line)) {
+      const now = Date.now()
+      if (now - lastErrLog < 15000) return
+      lastErrLog = now
+    }
     fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line.slice(0, 2500)}\n`)
   } catch {}
 }
@@ -139,9 +152,9 @@ function runCtl(action, id, timeout = 4000) {
 
 async function listIds() {
   const now = Date.now()
-  if (now - cachedAt < 250 && cachedIds) return cachedIds
+  if (now - cachedAt < 1200 && cachedIds) return cachedIds
   try {
-    const snap = await runCtl('list', '0', 2000)
+    const snap = await runCtl('list', '0', 2500)
     cachedIds = [...new Set((snap.ids || []).map(String))]
     cachedAt = Date.now()
     return cachedIds
