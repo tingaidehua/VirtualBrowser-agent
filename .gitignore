@@ -14,3 +14,7 @@ tools/*.log
 Thumbs.db
 .vscode/
 node_modules/
+
+# Local install, browser profiles, and machine backups. Never publish.
+runtime/
+_asar_extract-2.3.1/

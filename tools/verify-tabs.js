@@ -1,4 +1,4 @@
-﻿const http=require('http'); const WebSocket=require('./node_modules/ws'); const fs=require('fs')
+﻿const http=require('http'); const WebSocket=require('./node_modules/ws'); const fs=require('fs'); const path=require('path')
 function getJson(url){return new Promise((resolve,reject)=>{http.get(url,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(JSON.parse(d)))}).on('error',reject)})}
 ;(async()=>{
   const pages=await getJson('http://127.0.0.1:9229/json/list')
@@ -16,7 +16,8 @@ function getJson(url){return new Promise((resolve,reject)=>{http.get(url,res=>{l
   })()`,returnByValue:true,awaitPromise:true})
   console.log('control', JSON.stringify(r.result&&r.result.value,null,2))
   // Check prefs still have startup urls after launch
-  const pref=JSON.parse(fs.readFileSync('C:/Users/dcsco/AppData/Local/VirtualBrowser/Workers/1/Default/Preferences','utf8'))
+  const prefPath=path.join(process.env.LOCALAPPDATA || '', 'VirtualBrowser', 'Workers', '1', 'Default', 'Preferences')
+  const pref=JSON.parse(fs.readFileSync(prefPath,'utf8'))
   console.log('after launch restore_on_startup', pref.session&&pref.session.restore_on_startup)
   console.log('after launch startup_urls', pref.session&&pref.session.startup_urls)
   ws.close()

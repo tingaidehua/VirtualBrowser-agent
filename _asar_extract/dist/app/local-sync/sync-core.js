@@ -55,7 +55,7 @@ function loadSettings() {
     enabled: true,
     autoLoad: true,
     autoUploadOnExit: true,
-    autoSyncIntervalSec: 60,
+    autoSyncIntervalSec: 1800,
     restoreSession: false
   }
   const cfg = Object.assign({}, defaults, readJson(cfgFile, {}))
@@ -63,7 +63,8 @@ function loadSettings() {
   if (cfg.enabled == null) cfg.enabled = true
   if (cfg.autoLoad == null) cfg.autoLoad = true
   if (cfg.autoUploadOnExit == null) cfg.autoUploadOnExit = true
-  if (!cfg.autoSyncIntervalSec) cfg.autoSyncIntervalSec = 60
+  // 30min default; never below 10min
+  cfg.autoSyncIntervalSec = Math.max(600, Number(cfg.autoSyncIntervalSec) || 1800)
   cfg.restoreSession = false
   return { cfg, cfgFile }
 }
@@ -115,78 +116,120 @@ function loadGlobal() {
   return readJson(globalPath(), {})
 }
 
-const SKIP_DIR_NAMES = new Set([
-  'Cache', 'Code Cache', 'GPUCache', 'GrShaderCache', 'GraphiteDawnCache', 'ShaderCache',
-  'Service Worker', 'blob_storage', 'Crashpad', 'BrowserMetrics', 'optimization_guide_model_store',
-  'Crowd Deny', 'CertificateRevocation', 'Safe Browsing', 'component_crx_cache',
-  'JumpListIconsRecentClosed', 'JumpListIconsOld', 'JumpListIcons', 'File System',
-  'Platform Notifications', 'VideoDecodeStats', 'Shared Dictionary', 'segmentation_platform'
-])
-const SKIP_FILE_NAMES = new Set([
-  'lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket', 'LOCK', 'LOG', 'LOG.old'
-])
+/**
+ * Only sync login-valuable paths. Opening tabs / history / cache must NOT dirty sync.
+ * - Cookies + Login Data: session / password persistence
+ * - Local Storage: SPA tokens (copied, but fingerprint ignores noisy subfiles via cookie-centric fp)
+ */
+const VALUABLE_REL_PATHS = [
+  // Chromium cookies (modern)
+  path.join('Default', 'Network', 'Cookies'),
+  path.join('Default', 'Network', 'Cookies-journal'),
+  // Legacy cookies path
+  path.join('Default', 'Cookies'),
+  path.join('Default', 'Cookies-journal'),
+  // Saved passwords
+  path.join('Default', 'Login Data'),
+  path.join('Default', 'Login Data-journal'),
+  path.join('Default', 'Login Data For Account'),
+  path.join('Default', 'Login Data For Account-journal'),
+  // Site auth tokens (directories)
+  path.join('Default', 'Local Storage'),
+  path.join('Default', 'IndexedDB')
+]
 
-function dirStats(dir) {
+/** Paths that define "login changed" — browsing History/Sessions must not flip this. */
+const FINGERPRINT_REL_PATHS = [
+  path.join('Default', 'Network', 'Cookies'),
+  path.join('Default', 'Cookies'),
+  path.join('Default', 'Login Data'),
+  path.join('Default', 'Login Data For Account')
+]
+
+function collectFileStats(root, relPaths) {
   let total = 0
   let newest = 0
-  if (!fs.existsSync(dir)) return { size: 0, mtimeMs: 0 }
-  const walk = d => {
-    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
-      if (SKIP_FILE_NAMES.has(ent.name) || SKIP_DIR_NAMES.has(ent.name)) continue
-      const p = path.join(d, ent.name)
-      if (ent.isDirectory()) walk(p)
-      else {
-        try {
-          const st = fs.statSync(p)
-          total += st.size
-          if (st.mtimeMs > newest) newest = st.mtimeMs
-        } catch {}
+  const walkFile = p => {
+    try {
+      const st = fs.statSync(p)
+      if (st.isDirectory()) {
+        for (const ent of fs.readdirSync(p, { withFileTypes: true })) {
+          if (ent.name === 'LOCK' || ent.name === 'LOG' || ent.name === 'LOG.old') continue
+          walkFile(path.join(p, ent.name))
+        }
+      } else {
+        total += st.size
+        if (st.mtimeMs > newest) newest = st.mtimeMs
       }
-    }
+    } catch {}
   }
-  walk(dir)
+  for (const rel of relPaths) walkFile(path.join(root, rel))
   return { size: total, mtimeMs: newest }
 }
 
+function valuableStats(workerDir) {
+  return collectFileStats(workerDir, VALUABLE_REL_PATHS)
+}
+
+function loginFingerprintStats(workerDir) {
+  return collectFileStats(workerDir, FINGERPRINT_REL_PATHS)
+}
+
+function dirStats(dir) {
+  // kept for callers; now = valuable only
+  return valuableStats(dir)
+}
+
 function dirSize(dir) {
-  return dirStats(dir).size
+  return valuableStats(dir).size
 }
 
 function fingerprintEnv(user, workerDir, stOpt) {
-  const st = stOpt || dirStats(workerDir)
+  const st = stOpt || loginFingerprintStats(workerDir)
   const name = user && user.name != null ? user.name : ''
   const remark = user && user.remark != null ? user.remark : ''
   const group = JSON.stringify((user && user.group) || [])
   return `${st.size}:${Math.floor(st.mtimeMs)}:${name}:${remark}:${group}`
 }
 
-async function copyDir(src, dest) {
-  if (!fs.existsSync(src)) return { copied: 0 }
-  ensureDir(dest)
+async function copyPathRecursive(src, dest) {
+  if (!fs.existsSync(src)) return 0
   let copied = 0
-  for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
-    if (SKIP_FILE_NAMES.has(ent.name) || SKIP_DIR_NAMES.has(ent.name)) continue
-    const s = path.join(src, ent.name)
-    const d = path.join(dest, ent.name)
-    if (ent.isDirectory()) {
-      const r = await copyDir(s, d)
-      copied += r.copied
-    } else {
-      ensureDir(path.dirname(d))
-      try {
-        fs.copyFileSync(s, d)
-        copied++
-      } catch (e) {
-        // Cookies/LOCK etc may be busy while browser is running
-        if (e && (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES')) {
-          // skipped locked
-          continue
-        }
-        throw e
-      }
+  const st = fs.statSync(src)
+  if (st.isDirectory()) {
+    ensureDir(dest)
+    for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
+      if (ent.name === 'LOCK' || ent.name === 'LOG' || ent.name === 'LOG.old') continue
+      copied += await copyPathRecursive(path.join(src, ent.name), path.join(dest, ent.name))
     }
+    return copied
+  }
+  ensureDir(path.dirname(dest))
+  try {
+    fs.copyFileSync(src, dest)
+    return 1
+  } catch (e) {
+    if (e && (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES')) return 0
+    throw e
+  }
+}
+
+/** Copy only login-valuable files (whitelist). Never History / Sessions / Cache. */
+async function copyValuable(srcRoot, destRoot) {
+  if (!fs.existsSync(srcRoot)) return { copied: 0 }
+  ensureDir(destRoot)
+  let copied = 0
+  for (const rel of VALUABLE_REL_PATHS) {
+    const s = path.join(srcRoot, rel)
+    if (!fs.existsSync(s)) continue
+    copied += await copyPathRecursive(s, path.join(destRoot, rel))
   }
   return { copied }
+}
+
+/** @deprecated use copyValuable — kept name for any external callers */
+async function copyDir(src, dest) {
+  return copyValuable(src, dest)
 }
 
 async function removeDir(dir) {
@@ -217,7 +260,7 @@ async function listLocalEnvironments() {
     const syncedMeta = syncId && fs.existsSync(path.join(layout.envs, syncId, 'meta.json'))
       ? readJson(path.join(layout.envs, syncId, 'fp.json'), null)
       : null
-    const st = dirStats(workerDir)
+    const st = loginFingerprintStats(workerDir)
     const fp = fingerprintEnv(u, workerDir, st)
     return {
       id: u.id,
@@ -229,7 +272,7 @@ async function listLocalEnvironments() {
       syncEnabled: true,
       synced: !!syncedMeta,
       dirty: !syncedMeta || syncedMeta.fp !== fp,
-      size: st.size,
+      size: valuableStats(workerDir).size,
       updatedAt: u.updatedAt || u.createdAt || null,
       workerExists: fs.existsSync(workerDir)
     }
@@ -259,8 +302,12 @@ async function listSyncedEnvironments(syncPath) {
     }
   }
   const environments = [...byId.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)))
-  man.environments = environments
-  saveManifest(layout, man)
+  const prev = JSON.stringify(man.environments || [])
+  const next = JSON.stringify(environments)
+  if (prev !== next) {
+    man.environments = environments
+    saveManifest(layout, man)
+  }
   return { syncPath: layout.root, environments }
 }
 
@@ -297,14 +344,16 @@ async function uploadEnvironment(localId, syncPath) {
     }
   }
 
+  // Replace sync copy with whitelist only (drops old History/Cache junk from prior full syncs)
   await removeDir(destWorker)
   ensureDir(destEnv)
   writeJson(path.join(destEnv, 'meta.json'), user)
   writeJson(path.join(destEnv, 'fp.json'), {
     fp,
-    updatedAt: Date.now()
+    updatedAt: Date.now(),
+    mode: 'login-valuable'
   })
-  if (fs.existsSync(workerSrc)) await copyDir(workerSrc, destWorker)
+  if (fs.existsSync(workerSrc)) await copyValuable(workerSrc, destWorker)
   else ensureDir(destWorker)
 
   try { fs.copyFileSync(profilesPath(), layout.virtualCopy) } catch {}
@@ -368,9 +417,9 @@ async function downloadEnvironment(syncId, syncPath, { bindLocalId } = {}) {
 
   const workerDest = path.join(workers, String(user.id))
   const workerSrc = path.join(envDir, 'worker')
-  await removeDir(workerDest)
-  if (fs.existsSync(workerSrc)) await copyDir(workerSrc, workerDest)
-  else ensureDir(workerDest)
+  // Overlay valuable files only — never wipe local History/Cache/Sessions
+  ensureDir(workerDest)
+  if (fs.existsSync(workerSrc)) await copyValuable(workerSrc, workerDest)
 
   return { localId: user.id, syncId: String(syncId), name: user.name }
 }
@@ -453,23 +502,90 @@ async function autoLoadFromSync(syncPath) {
   return { restored }
 }
 
-async function autoSyncNow(syncPath) {
+function fileSig(p) {
+  try {
+    const st = fs.statSync(p)
+    return `${st.size}:${Math.floor(st.mtimeMs)}`
+  } catch {
+    return '0'
+  }
+}
+
+/** Cheap token: profiles/global + per-env cookie/login mtimes (not History/Sessions). */
+function localChangeToken() {
+  const parts = [fileSig(profilesPath()), fileSig(globalPath())]
+  try {
+    const workers = workersRoot(loadGlobal())
+    if (fs.existsSync(workers)) {
+      for (const ent of fs.readdirSync(workers, { withFileTypes: true })) {
+        if (!ent.isDirectory()) continue
+        const st = loginFingerprintStats(path.join(workers, ent.name))
+        parts.push(`${ent.name}:${st.size}:${Math.floor(st.mtimeMs)}`)
+      }
+    }
+  } catch {}
+  return parts.join('|')
+}
+
+function copyIfChanged(src, dest) {
+  if (!fs.existsSync(src)) return false
+  try {
+    if (fs.existsSync(dest)) {
+      const a = fs.statSync(src)
+      const b = fs.statSync(dest)
+      if (a.size === b.size && Math.floor(a.mtimeMs) === Math.floor(b.mtimeMs)) return false
+    }
+  } catch {}
+  ensureDir(path.dirname(dest))
+  fs.copyFileSync(src, dest)
+  try {
+    const st = fs.statSync(src)
+    fs.utimesSync(dest, st.atime, st.mtime)
+  } catch {}
+  return true
+}
+
+let _lastAutoToken = null
+let _lastPullAt = 0
+
+async function autoSyncNow(syncPath, opts) {
   const { cfg } = loadSettings()
   if (!cfg.enabled) return { skipped: true }
   const target = syncPath || cfg.syncPath
   ensureDir(target)
-  const pulled = await autoLoadFromSync(target)
-  const uploaded = (await uploadChanged(target)).filter(x => !x.skipped)
-  // always mirror latest virtual/global
+  const force = !!(opts && opts.force)
+  const token = localChangeToken()
+  const now = Date.now()
+  // Skip full work when nothing local changed; still pull remote at most every 30min
+  const needPull = force || !_lastPullAt || now - _lastPullAt > 30 * 60 * 1000
+  if (!force && _lastAutoToken === token && !needPull) {
+    return { skipped: true, reason: 'unchanged', pulled: 0, uploaded: 0, uploadedItems: [] }
+  }
+
+  let pulled = { restored: [] }
+  if (needPull) {
+    pulled = await autoLoadFromSync(target)
+    _lastPullAt = now
+  }
+
+  let uploaded = []
+  if (force || _lastAutoToken !== token) {
+    uploaded = (await uploadChanged(target)).filter(x => !x.skipped)
+  }
+  _lastAutoToken = token
+
+  // Mirror virtual/global only when content/mtime actually differs (avoids waking OneDrive)
+  let mirrored = 0
   try {
     const layout = syncLayout(target)
-    if (fs.existsSync(profilesPath())) fs.copyFileSync(profilesPath(), layout.virtualCopy)
-    if (fs.existsSync(globalPath())) fs.copyFileSync(globalPath(), layout.globalCopy)
+    if (copyIfChanged(profilesPath(), layout.virtualCopy)) mirrored++
+    if (copyIfChanged(globalPath(), layout.globalCopy)) mirrored++
   } catch {}
   return {
     pulled: (pulled.restored || []).length,
     uploaded: uploaded.length,
-    uploadedItems: uploaded.map(x => ({ id: x.localId, name: x.name, syncId: x.syncId }))
+    uploadedItems: uploaded.map(x => ({ id: x.localId, name: x.name, syncId: x.syncId })),
+    mirrored
   }
 }
 
@@ -653,6 +769,7 @@ module.exports = {
   uploadChanged,
   autoLoadFromSync,
   autoSyncNow,
+  localChangeToken,
   userDataRoot,
   syncLayout,
   profilesPath,

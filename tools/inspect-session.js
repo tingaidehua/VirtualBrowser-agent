@@ -1,6 +1,6 @@
 ﻿const fs = require('fs')
 const path = require('path')
-const base = 'C:/Users/dcsco/AppData/Local/VirtualBrowser/Workers/1/Default'
+const base = path.join(process.env.LOCALAPPDATA || '', 'VirtualBrowser', 'Workers', '1', 'Default')
 const pref = JSON.parse(fs.readFileSync(path.join(base, 'Preferences'), 'utf8'))
 console.log('prefs', {
   exit_type: pref.profile && pref.profile.exit_type,
@@ -26,5 +26,5 @@ if (fs.existsSync(sessDir)) {
 for (const f of fs.readdirSync(base)) {
   if (/session|tabs|current|last/i.test(f)) console.log('file', f, fs.statSync(path.join(base, f)).size)
 }
-const sr = 'C:/Users/dcsco/AppData/Local/VirtualBrowser/session-restore.json'
+const sr = path.join(process.env.LOCALAPPDATA || '', 'VirtualBrowser', 'session-restore.json')
 console.log('session-restore', fs.existsSync(sr) ? fs.readFileSync(sr, 'utf8') : 'missing')

@@ -529,8 +529,8 @@
   const timer = setInterval(() => {
     tries++
     scheduleEnhance(0)
-    if (tries > 40) clearInterval(timer)
-  }, 800)
+    if (tries > 25) clearInterval(timer)
+  }, 1200)
   const mo = new MutationObserver(() => {
     if (enhanceBusy) return
     scheduleEnhance(250)
@@ -837,6 +837,8 @@
     }
   } catch {}
   pollOsRunning().then(() => scheduleEnhance(0))
+  // Fallback poll only — main process already pushes vb-local-sync:running.
+  // Keep interval long to avoid stacking IPC/CPU when push is healthy.
   setInterval(() => {
     pollOsRunning().then(() => {
       const key = [...(window.__vbOsRunningIds || [])].sort().join(',')
@@ -845,27 +847,10 @@
         scheduleEnhance(0)
       }
     })
-  }, 3000)
+  }, 8000)
 
   window.vbLocalSyncEnhanceTable = enhanceBrowserTable
   setTimeout(() => scheduleEnhance(0), 400)
-  setTimeout(() => {
-    try {
-      const fs = (window.require && window.require('fs')) || null
-      const path = (window.require && window.require('path')) || null
-      const info = {
-        hideMain: document.documentElement.classList.contains('vb-ls-hide-main') || document.body.classList.contains('vb-ls-hide-main'),
-        appKids: document.querySelectorAll('#app > *').length,
-        tables: document.querySelectorAll('.el-table').length,
-        rows: document.querySelectorAll('.el-table__body tr').length,
-        actions: document.querySelectorAll('td.actions-cell, td.fixed-width').length,
-        bodyText: (document.body && document.body.innerText || '').slice(0, 80)
-      }
-      if (fs && path) {
-        fs.writeFileSync(path.join(process.env.APPDATA || '', 'virtual-browser', 'logs', 'compact-probe.json'), JSON.stringify(info, null, 2))
-      }
-    } catch (e) {}
-  }, 2500)
 
   console.log('[local-sync] UI ready (list compact)')
 })();

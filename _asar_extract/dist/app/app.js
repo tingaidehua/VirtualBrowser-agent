@@ -1,4 +1,4 @@
-﻿require('bytenode');
+const start = () => { require('bytenode'); require('./app.jsc'); };
 try {
   const path = require('path');
   const fs = require('fs');
@@ -6,12 +6,10 @@ try {
     path.join(__dirname, 'local-sync', 'bootstrap.js'),
     path.join(process.resourcesPath || '', 'local-sync', 'bootstrap.js')
   ];
-  let loaded = false;
   for (const p of candidates) {
     try {
       if (fs.existsSync(p)) {
         require(p);
-        loaded = true;
         console.log('[local-sync] loaded', p);
         break;
       }
@@ -19,8 +17,7 @@ try {
       console.error('[local-sync] load failed', p, e);
     }
   }
-  if (!loaded) console.warn('[local-sync] bootstrap not found');
 } catch (e) {
   console.error('[local-sync] init error', e);
 }
-require('./app.jsc');
+start();

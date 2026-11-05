@@ -5,8 +5,16 @@ function log(...args) {
   try {
     const dir = path.join(process.env.APPDATA || '', 'virtual-browser', 'logs')
     fs.mkdirSync(dir, { recursive: true })
+    const file = path.join(dir, 'local-sync.log')
+    try {
+      const st = fs.statSync(file)
+      if (st.size > 1024 * 1024) {
+        const keep = fs.readFileSync(file, 'utf8').slice(-300000)
+        fs.writeFileSync(file, keep)
+      }
+    } catch {}
     fs.appendFileSync(
-      path.join(dir, 'local-sync.log'),
+      file,
       `[${new Date().toISOString()}] ${args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}\n`
     )
   } catch {}
@@ -70,9 +78,14 @@ function install() {
     }
     syncing = true
     try {
-      log('auto sync start', reason)
-      const r = await core.autoSyncNow(cfg.syncPath)
-      log('auto sync done', reason, r)
+      const force = reason === 'manual' || reason === 'startup' || reason === 'settings-changed' || reason === 'path-changed'
+      if (force || reason !== 'interval') log('auto sync start', reason)
+      const r = await core.autoSyncNow(cfg.syncPath, { force })
+      if (r && r.skipped && r.reason === 'unchanged') {
+        // quiet: no-op interval ticks should not inflate local-sync.log
+      } else {
+        log('auto sync done', reason, r)
+      }
       return r
     } catch (e) {
       log('auto sync failed', reason, String(e && e.stack || e))
@@ -117,7 +130,7 @@ function install() {
   function setupInterval() {
     if (intervalTimer) clearInterval(intervalTimer)
     const { cfg } = core.loadSettings()
-    const sec = Math.max(30, Number(cfg.autoSyncIntervalSec) || 60)
+    const sec = Math.max(600, Number(cfg.autoSyncIntervalSec) || 1800)
     intervalTimer = setInterval(() => {
       runAutoSync('interval')
     }, sec * 1000)
@@ -423,11 +436,21 @@ function install() {
   }
 
   const injectUi = async win => {
+    if (!win || win.isDestroyed()) return
+    // debounce: avoid double inject from dom-ready + did-finish-load
+    const now = Date.now()
+    if (win.__vbLsInjectAt && now - win.__vbLsInjectAt < 1500) return
+    win.__vbLsInjectAt = now
     try {
       await win.webContents.executeJavaScript(uiSource(), true)
       log('ui injected', win.id)
       setTimeout(() => probeLayout(win), 1500)
-      setTimeout(() => probeTable(win), 2500)
+      // probeTable is debug-only (same gate as layout/stress)
+      const probeFlag = path.join(process.env.APPDATA || '', 'virtual-browser', 'selftest-table')
+      if (fs.existsSync(probeFlag)) {
+        try { fs.unlinkSync(probeFlag) } catch {}
+        setTimeout(() => probeTable(win), 2500)
+      }
       setTimeout(() => stressButtons(win), 5000)
     } catch (e) {
       log('ui inject failed', String(e))
@@ -438,20 +461,30 @@ function install() {
     if (!win || win.__vbLocalSyncHooked) return
     win.__vbLocalSyncHooked = true
     win.webContents.on('did-finish-load', () => injectUi(win))
-    win.webContents.on('dom-ready', () => injectUi(win))
     // page may already be loaded when we hook late
     try {
       if (!win.webContents.isLoading()) injectUi(win)
     } catch {}
   }
 
+  // Do not rewrite settings every boot (was forcing enabled:true + touching config each launch)
   try {
-    core.saveSettings({
-      enabled: true,
-      autoLoad: true,
-      autoUploadOnExit: true,
-      restoreSession: false
-    })
+    const cfgPath = path.join(core.userDataRoot(), 'local-sync-settings.json')
+    if (!fs.existsSync(cfgPath)) {
+      core.saveSettings({
+        enabled: true,
+        autoLoad: true,
+        autoUploadOnExit: true,
+        autoSyncIntervalSec: 1800,
+        restoreSession: false
+      })
+    } else {
+      // migrate legacy short intervals to 30min
+      const { cfg } = core.loadSettings()
+      if (Number(cfg.autoSyncIntervalSec) < 1800) {
+        core.saveSettings({ autoSyncIntervalSec: 1800 })
+      }
+    }
   } catch {}
 
   app.on('browser-window-created', (_e, win) => hookWindow(win))
@@ -463,18 +496,22 @@ function install() {
     // keep trying in case first window appears late
     const hookTimer = setInterval(() => {
       BrowserWindow.getAllWindows().forEach(hookWindow)
-    }, 1000)
-    setTimeout(() => clearInterval(hookTimer), 30000)
+    }, 2000)
+    setTimeout(() => clearInterval(hookTimer), 20000)
     await runAutoSync('startup')
     BrowserWindow.getAllWindows().forEach(hookWindow)
     try { workerCtl.ensureExe() } catch (e) { log('ensureExe', String(e)) }
+    let lastRunningKey = ''
     setInterval(() => {
       workerCtl.listIds().then(ids => {
+        const key = (ids || []).map(String).sort().join(',')
+        if (key === lastRunningKey) return
+        lastRunningKey = key
         BrowserWindow.getAllWindows().forEach(w => {
           try { w.webContents.send('vb-local-sync:running', ids) } catch {}
         })
       }).catch(() => {})
-    }, 2500)
+    }, 5000)
   }).catch(e => log('whenReady error', String(e)))
 
   app.on('before-quit', () => {
